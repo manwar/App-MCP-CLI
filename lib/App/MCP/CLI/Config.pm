@@ -32,25 +32,27 @@ This module is distributed as part of L<App::MCP::CLI> v0.0.1.
     my $config = load_config();   # auto-discovers
 
     # Resolve a named server to a command array (stdio) or URL (SSE)
-    my ($cmd, $url) = resolve_server_cmd($config, 'perl-math-server');
+    my ($cmd, $url, $env) = resolve_server_cmd($config, 'perl-math-server');
 
     if ($url) {
         # SSE transport
-    } else {
-        # stdio transport — spawn with open2($out, $in, @$cmd)
+    }
+    else {
+        # stdio transport - see App::MCP::CLI::Client, which spawns @$cmd
+        # with %$env applied to the child only
     }
 
 =head1 DESCRIPTION
 
 C<App::MCP::CLI::Config> is the shared configuration layer for all
-C<App::MCP::CLI> sub-commands.  It provides two exported functions:
+C<App::MCP::CLI> sub-commands. It provides two exported functions:
 
 =over 4
 
-=item * L</load_config> — reads and parses the JSON configuration file,
+=item * L</load_config> - reads and parses the JSON configuration file,
 with automatic discovery of well-known paths when no explicit path is given.
 
-=item * L</resolve_server_cmd> — maps a server name (or bare command string,
+=item * L</resolve_server_cmd> - maps a server name (or bare command string,
 script path, or URL) to either a command array for stdio transport or a URL
 for SSE transport.
 
@@ -81,7 +83,7 @@ The JSON configuration file has the following top-level structure:
 =head2 mcpServers
 
 A JSON object whose keys are server alias names and whose values are server
-descriptor objects.  Each descriptor supports the following fields:
+descriptor objects. Each descriptor supports the following fields:
 
 =over 4
 
@@ -93,28 +95,29 @@ C<"node">).  Required for stdio servers.
 =item C<args> (array of strings)
 
 Additional command-line arguments passed to C<command>
-(e.g. C<["stdio_server.pl"]>).  Defaults to an empty list.
+(e.g. C<["stdio_server.pl"]>). Defaults to an empty list.
 
 =item C<env> (object)
 
-A map of environment variable names to values.  Each entry is set in the
-process environment before the server subprocess is launched.
+A map of environment variable names to values. The entries are passed to the
+server subprocess only; they are never set in the C<mcpcli> process itself.
 
 =item C<url> (string)
 
 The SSE endpoint URL for remote servers (e.g.
-C<"http://mcp.example.com/sse">).  When present, the server is contacted via
+C<"http://mcp.example.com/sse">). When present, the server is contacted via
 HTTP/SSE instead of a local subprocess.
 
 =item C<transport> (string)
 
-Set to C<"sse"> to force SSE mode even when no C<url> key is present.
+Informational (C<"stdio"> or C<"sse">). A server is treated as SSE when it has
+a C<url>. C<transport: "sse"> without a C<url> is rejected with an error.
 
 =back
 
 =head2 confirmTools
 
-Optional boolean (default C<true>).  When set to C<false>, the
+Optional boolean (default C<true>). When set to C<false>, the
 C<interactive>/C<chat> command executes tool calls autonomously without pausing
 to ask the user for confirmation.
 
@@ -125,11 +128,11 @@ searches for a configuration file in the following locations, in order:
 
 =over 4
 
-=item 1. C<./server_config.json> — in the current working directory.
+=item 1. C<./server_config.json> - in the current working directory.
 
-=item 2. C<./mcp-config.json> — in the current working directory.
+=item 2. C<./mcp-config.json> - in the current working directory.
 
-=item 3. C<$HOME/.config/mcp-cli/config.json> — XDG-style user config
+=item 3. C<$HOME/.config/mcp-cli/config.json> - XDG-style user config
 (C<$USERPROFILE> is used as the home directory on Windows).
 
 =back
@@ -140,87 +143,109 @@ C<--server> command string).
 
 =head1 EXPORTS
 
-Nothing is exported by default.  The following functions may be imported
+Nothing is exported by default. The following functions may be imported
 explicitly:
 
     use App::MCP::CLI::Config qw(load_config resolve_server_cmd);
 
 =head1 FUNCTIONS
 
-=head2 load_config( [$path] )
+=head2 load_config
+
+Signature: C<load_config( [$path] )>.
 
     my $config = load_config();
     my $config = load_config('/path/to/server_config.json');
 
-Loads and parses the JSON configuration file at C<$path>.  If C<$path> is
+Loads and parses the JSON configuration file at C<$path>. If C<$path> is
 omitted or C<undef>, the auto-discovery sequence described in L</AUTO-DISCOVERY>
 is used.
 
-Returns a Perl data structure (hashref) representing the parsed JSON on
-success, or C<undef> if no config file could be found or opened.  A warning is
-printed to STDERR if the file exists but cannot be parsed as valid JSON.
+Returns a hashref on success, or C<undef> when no path was given and no
+well-known file exists. When a path B<is> given explicitly, a missing or
+unreadable file, or invalid JSON, is a fatal error (C<die>), so typos in
+C<--config> are never silently ignored. A discovered file that cannot be
+parsed only produces a warning on STDERR and C<undef>.
+
+Informational messages are written to STDERR so that STDOUT stays clean for
+piping.
 
 =cut
 
 sub load_config {
     my ($config_path) = @_;
 
-    my $json = JSON::MaybeXS->new(utf8 => 1, allow_nonref => 1);
+    my $json     = JSON::MaybeXS->new(utf8 => 1, allow_nonref => 1);
+    my $explicit = defined $config_path && length $config_path;
 
     # Auto-discover if not explicitly given
-    if (!$config_path) {
+    if (!$explicit) {
         my $home = $ENV{HOME} || $ENV{USERPROFILE} || '.';
         my $xdg  = File::Spec->catfile($home, '.config', 'mcp-cli', 'config.json');
 
         if    (-f 'server_config.json') { $config_path = 'server_config.json' }
         elsif (-f 'mcp-config.json')    { $config_path = 'mcp-config.json'    }
         elsif (-f $xdg)                 { $config_path = $xdg                 }
+        else                            { return undef                        }
     }
 
-    return undef unless $config_path && -f $config_path;
+    die "Config file not found: $config_path\n" if $explicit && !-f $config_path;
 
-    print "[-] Reading configuration from: $config_path\n";
+    print STDERR "[-] Reading configuration from: $config_path\n";
     open my $fh, '<', $config_path or do {
+        die "Could not open config file '$config_path': $!\n" if $explicit;
         warn "[-] Warning: Could not open config file: $!\n";
         return undef;
     };
-    local $/;
-    my $content = <$fh>;
+    my $content = do { local $/; <$fh> };
     close $fh;
 
     my $data = eval { $json->decode($content) };
-    warn "[-] Warning: Failed to parse config JSON: $@\n" if $@;
+    if ($@) {
+        (my $err = $@) =~ s/ at \S+ line \d+\.?\s*\z//;
+        die "Failed to parse config '$config_path': $err\n" if $explicit;
+        warn "[-] Warning: Failed to parse config JSON ($config_path): $err\n";
+        return undef;
+    }
     return $data;
 }
 
-=head2 resolve_server_cmd( $config, $server_input )
+=head2 resolve_server_cmd
 
-    my ($cmd, $url) = resolve_server_cmd($config, 'perl-math-server');
-    my ($cmd, $url) = resolve_server_cmd($config, 'http://localhost/sse');
-    my ($cmd, $url) = resolve_server_cmd($config, 'perl stdio_server.pl');
+Signature: C<resolve_server_cmd( $config, $server_input )>.
 
-Resolves C<$server_input> to a transport endpoint.  C<$config> is the hashref
+    my ($cmd, $url, $env) = resolve_server_cmd($config, 'perl-math-server');
+    my ($cmd, $url, $env) = resolve_server_cmd($config, 'http://localhost/sse');
+    my ($cmd, $url, $env) = resolve_server_cmd($config, 'perl stdio_server.pl');
+    my ($cmd, $url, $env) = resolve_server_cmd($config);   # sole configured server
+
+Resolves C<$server_input> to a transport endpoint. C<$config> is the hashref
 returned by L</load_config> (may be C<undef>).
 
 Resolution order:
 
 =over 4
 
-=item 1. If C<$config> contains a matching C<mcpServers> entry, that
-descriptor is used.  Environment variables from the C<env> block are applied
-to C<%ENV> immediately.
+=item 1. If C<$server_input> is empty or C<undef>: when the configuration
+defines exactly one server, that server is used; otherwise this is a fatal
+error that lists the available names.
 
-=item 2. If C<$server_input> looks like an HTTP(S) URL, SSE mode is selected.
+=item 2. If C<$config> contains a matching C<mcpServers> entry, that
+descriptor is used. A descriptor with a C<url> is an SSE server. One whose
+C<transport> is C<sse> but which has no C<url>, or one with neither C<url>
+nor C<command>, is a fatal error with an explanatory message.
 
-=item 3. If C<$server_input> ends in C<.pl> and the file exists, it is run
+=item 3. If C<$server_input> looks like an HTTP(S) URL, SSE mode is selected.
+
+=item 4. If C<$server_input> ends in C<.pl> and the file exists, it is run
 with the current Perl interpreter (C<$^X>).
 
-=item 4. Otherwise, C<$server_input> is split on whitespace and used as a
+=item 5. Otherwise, C<$server_input> is split on whitespace and used as a
 raw command list.
 
 =back
 
-Return value is a two-element list C<($cmd, $url)>:
+Return value is a three-element list C<($cmd, $url, $env)>:
 
 =over 4
 
@@ -230,6 +255,11 @@ suitable for passing to C<IPC::Open2::open2>; C<$url> is C<undef>.
 =item * For B<SSE> servers: C<$url> is the endpoint URL string; C<$cmd> is
 C<undef>.
 
+=item * C<$env> is a hashref of extra environment variables from the
+descriptor's C<env> block (empty when there is none). It is B<not> applied to
+the current process; L<App::MCP::CLI::Client> sets it for the spawned server
+only, so variables never leak from one server to another.
+
 =back
 
 =cut
@@ -237,22 +267,40 @@ C<undef>.
 sub resolve_server_cmd {
     my ($config_data, $server_input) = @_;
 
-    if ($config_data && $config_data->{mcpServers}{$server_input}) {
-        my $srv = $config_data->{mcpServers}{$server_input};
-        print "[-] Resolved server settings for '$server_input' via config file.\n";
+    my $servers = ($config_data && ref $config_data->{mcpServers} eq 'HASH')
+                ? $config_data->{mcpServers} : {};
 
-        if (my $env_vars = $srv->{env}) {
-            $ENV{$_} = $env_vars->{$_} for keys %$env_vars;
-        }
+    if (!defined $server_input || $server_input eq '') {
+        my @names = sort keys %$servers;
+        return resolve_server_cmd($config_data, $names[0]) if @names == 1;
 
-        return ($srv->{url} ? (undef, $srv->{url})  # SSE
-                            : ([$srv->{command}, @{$srv->{args} // []}], undef));
+        die "No server specified. Use --server <name|url|command>"
+          . (@names ? ". Configured servers: " . join(', ', @names) : '')
+          . "\n";
+    }
+
+    if (ref $servers->{$server_input} eq 'HASH') {
+        my $srv = $servers->{$server_input};
+        print STDERR "[-] Resolved server settings for '$server_input' via config file.\n";
+
+        my $env = ref $srv->{env} eq 'HASH' ? { %{ $srv->{env} } } : {};
+
+        return (undef, $srv->{url}, $env) if defined $srv->{url} && length $srv->{url};
+
+        die "Server '$server_input' has transport 'sse' but no 'url'.\n"
+            if lc($srv->{transport} // '') eq 'sse';
+
+        die "Server '$server_input' has neither a 'command' nor a 'url'.\n"
+            unless defined $srv->{command} && length $srv->{command};
+
+        my $args = ref $srv->{args} eq 'ARRAY' ? $srv->{args} : [];
+        return ([$srv->{command}, @$args], undef, $env);
     }
 
     # Fallback
-    if    ($server_input =~ /^https?:\/\//i) { return (undef, $server_input) }
-    elsif ($server_input =~ /\.pl$/ && -f $server_input) { return ([$^X, $server_input], undef) }
-    else  { return ([split ' ', $server_input], undef) }
+    if    ($server_input =~ /^https?:\/\//i)             { return (undef, $server_input, {}) }
+    elsif ($server_input =~ /\.pl$/ && -f $server_input) { return ([$^X, $server_input], undef, {}) }
+    else  { return ([split ' ', $server_input], undef, {}) }
 }
 
 =head1 SEE ALSO
@@ -269,9 +317,11 @@ sub resolve_server_cmd {
 
 =item * L<App::MCP::CLI::Command::servers>
 
-=item * L<JSON::MaybeXS> — JSON parser used internally.
+=item * L<App::MCP::CLI::Client>
 
-=item * L<File::Spec> — used for portable config path construction.
+=item * L<JSON::MaybeXS> - JSON parser used internally.
+
+=item * L<File::Spec> - used for portable config path construction.
 
 =item * MCP specification: L<https://spec.modelcontextprotocol.io/>
 
@@ -304,10 +354,6 @@ You can also look for information at:
 =item * BUG Report
 
 L<https://github.com/manwar/App-MCP-CLI/issues>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/App-MCP-CLI>
 
 =item * Search MetaCPAN
 

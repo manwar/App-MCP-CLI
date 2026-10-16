@@ -44,7 +44,7 @@ C<App::MCP::CLI> is a Perl implementation of a command-line client for servers
 that implement the B<Model Context Protocol (MCP)>, a JSON-RPC 2.0-based protocol
 for exposing callable "tools" to AI agents and other automation clients.
 
-The distribution provides three sub-commands:
+The distribution provides five sub-commands:
 
 =over 4
 
@@ -57,7 +57,15 @@ an interactive prompt when none are supplied.
 natural-language queries through a local LLM (currently Ollama) to the appropriate
 MCP tool and streams the results back.
 
+=item * B<servers> - show the servers defined in the configuration file.
+
+=item * B<version> - print the installed version.
+
 =back
+
+Both stdio servers and HTTP/SSE servers are supported by every command that
+talks to a server (C<list>, C<call>, C<chat>), through the shared
+L<App::MCP::CLI::Client>.
 
 =head1 CONFIGURATION
 
@@ -75,9 +83,15 @@ L<App::MCP::CLI::Command::interactive> for the JSON configuration file format.
 
 =item * L<App::MCP::CLI::Command::interactive>
 
+=item * L<App::MCP::CLI::Command::servers>
+
+=item * L<App::MCP::CLI::Client>
+
+=item * L<App::MCP::CLI::Config>
+
 =item * L<App::Cmd> - the framework used to dispatch sub-commands.
 
-=item * MCP specification: L<https://spec.modelcontextprotocol.io/>
+=item * MCP specification: L<https://modelcontextprotocol.io/specification>
 
 =back
 
@@ -108,10 +122,6 @@ You can also look for information at:
 =item * BUG Report
 
 L<https://github.com/manwar/App-MCP-CLI/issues>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/App-MCP-CLI>
 
 =item * Search MetaCPAN
 

@@ -9,9 +9,8 @@ our $AUTHORITY = 'cpan:MANWAR';
 
 use App::MCP::CLI -command;
 
-use IPC::Open2;
-use JSON::MaybeXS;
 use Text::Table::Tiny qw(generate_table);
+use App::MCP::CLI::Client;
 use App::MCP::CLI::Config qw(load_config resolve_server_cmd);
 
 =encoding utf8
@@ -27,18 +26,23 @@ This module is distributed as part of L<App::MCP::CLI> v0.0.1.
 =head1 SYNOPSIS
 
     # Print a table of every tool the server exposes
+    mcpcli list --server perl-math-server
+
+    # The only configured server is used when --server is omitted
     mcpcli list
 
-    # Override the server command for this invocation
-    MCP_SERVER="node server.js" mcpcli list
+    # Use a script, a raw command, or an SSE URL instead of a config name
+    mcpcli list --server ./stdio_server.pl
+    mcpcli list --server "node server.js"
+    mcpcli list --server http://localhost:8080/sse
 
 =head1 DESCRIPTION
 
 C<App::MCP::CLI::Command::list> implements the C<list> sub-command of the
-C<mcpcli> application. It launches the configured MCP server as a child
-process, completes the JSON-RPC 2.0 C<initialize> handshake, sends a
-C<tools/list> request, and renders the resulting tool catalogue as a plain
-ASCII table using L<Text::Table::Tiny>.
+C<mcpcli> application. It connects to the MCP server over stdio or HTTP/SSE
+(through L<App::MCP::CLI::Client>), completes the C<initialize> handshake,
+sends C<tools/list> (following pagination), and renders the resulting tool
+catalogue as a plain ASCII table using L<Text::Table::Tiny>.
 
 The table has two columns:
 
@@ -55,10 +59,31 @@ server.> is printed instead.
 
 =head1 USAGE
 
-    mcpcli list
+    mcpcli list [--server <name|path|url|command>] [--config <file>] [--timeout <seconds>]
 
-No positional arguments or command-specific flags are accepted.  Use
-C<mcpcli help list> for the built-in help text.
+=head1 OPTIONS
+
+=over 4
+
+=item C<--server|-s> I<name>
+
+Server name from the config file, a C<.pl> script, a URL, or a command. May be
+omitted when the config file defines exactly one server.
+
+=item C<--config|-c> I<path>
+
+Path to the JSON configuration file. See L<App::MCP::CLI::Config>.
+
+=item C<--timeout|-t> I<seconds>
+
+How long to wait for the server (default 30; C<0> waits forever).
+
+=back
+
+=head1 EXIT STATUS
+
+C<0> on success, C<1> if the server could not be started or reached, did not
+answer in time, or the configuration is invalid. Errors are printed to STDERR.
 
 =head1 INTERNAL METHODS
 
@@ -71,8 +96,10 @@ via L<App::Cmd>.
 
 sub opt_spec {
     return (
-        [ 'server|s=s', 'server name from config'  ],
-        [ 'config|c=s', 'path to config JSON file' ],
+        [ 'server|s=s',  'server name, script path, URL or command'            ],
+        [ 'config|c=s',  'path to config JSON file'                            ],
+        [ 'timeout|t=i', 'seconds to wait for the server (0 = forever)',
+                         { default => 30 }                                      ],
     );
 }
 
@@ -102,22 +129,27 @@ prints the ASCII table (or a "none found" notice).
 sub execute {
     my ($self, $opt, $args) = @_;
 
-    my $config_data = load_config($opt->config);
-    my ($cmd)       = resolve_server_cmd($config_data, $opt->server);
+    my $tools = eval {
+        my $config_data       = load_config($opt->config);
+        my ($cmd, $url, $env) = resolve_server_cmd($config_data, $opt->server);
 
-    $App::MCP::CLI::Command::SERVER_CMD = $cmd;
+        my $client = App::MCP::CLI::Client->new(
+            cmd => $cmd, url => $url, env => $env, timeout => $opt->timeout,
+        );
+        $client->connect;
 
-    my ($json, $in, $out, $pid) = _connect_server();
+        my $list = eval { $client->list_tools };
+        my $err  = $@;
+        $client->close;
+        die $err if $err;
+        $list;
+    };
 
-    _mcp_handshake($json, $in, $out);
-
-    print $in $json->encode({
-        id      => 2,
-        jsonrpc => "2.0",
-        method  => "tools/list"
-    }) . "\n";
-    my $res   = $json->decode(scalar <$out>);
-    my $tools = $res->{result}{tools} // [];
+    if (my $err = $@) {
+        $err .= "\n" unless $err =~ /\n\z/;
+        print STDERR "Error: $err";
+        exit 1;
+    }
 
     if (!@$tools) {
         print "No tools found on the server.\n";
@@ -126,7 +158,7 @@ sub execute {
 
     my @rows = (['Tool Name', 'Description']);
     foreach my $tool (@$tools) {
-        push @rows, [ $tool->{name}, $tool->{description} // 'N/A' ];
+        push @rows, [ $tool->{name} // '', $tool->{description} // 'N/A' ];
     }
 
     print "\nAvailable MCP Tools:\n";
@@ -134,70 +166,6 @@ sub execute {
         rows       => \@rows,
         header_row => 1,
         style      => 'classic'), "\n";
-
-    _cleanup($in, $out, $pid);
-}
-
-=head2 _connect_server
-
-Constructs a L<JSON::MaybeXS> encoder, spawns the MCP server subprocess via
-C<IPC::Open2>, and returns C<($json, $stdin_fh, $stdout_fh, $pid)>.
-
-=cut
-
-sub _connect_server {
-    my $json = JSON::MaybeXS->new(utf8 => 1, allow_nonref => 1);
-
-    my ($chld_out, $chld_in);
-
-    my $pid = open2($chld_out, $chld_in, @$App::MCP::CLI::Command::SERVER_CMD)
-        or die "Server failed: $!";
-
-    return ($json, $chld_in, $chld_out, $pid);
-}
-
-=head2 _mcp_handshake( $json, $in, $out )
-
-Sends the JSON-RPC C<initialiize> request and discards the server's response,
-completing the mandatory MCP handshake before any tool-related requests can
-be made.
-
-=cut
-
-sub _mcp_handshake {
-    my ($json, $in, $out) = @_;
-
-    my $init = {
-        id      => 1,
-        jsonrpc => "2.0",
-        method  => "initialize",
-        params  => {
-            protocolVersion => "2024-11-05",
-            capabilities    => {},
-            clientInfo      => {
-                name    => "mcp-cli-perl",
-                version => "1.0"
-            }
-        }
-    };
-
-    print $in $json->encode($init) . "\n";
-    my $res = <$out>;
-}
-
-=head2 _cleanup( $in, $out, $pid )
-
-Closes the child process's stdin and stdout handles and calls C<waitpid> to
-reap the server subprocess.
-
-=cut
-
-sub _cleanup {
-    my ($in, $out, $pid) = @_;
-
-    close($in);
-    close($out);
-    waitpid($pid, 0);
 }
 
 =head1 SEE ALSO
@@ -241,10 +209,6 @@ You can also look for information at:
 =item * BUG Report
 
 L<https://github.com/manwar/App-MCP-CLI/issues>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/App-MCP-CLI>
 
 =item * Search MetaCPAN
 

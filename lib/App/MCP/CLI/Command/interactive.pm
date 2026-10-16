@@ -9,9 +9,9 @@ our $AUTHORITY = 'cpan:MANWAR';
 
 use App::MCP::CLI -command;
 
-use IPC::Open2;
 use HTTP::Tiny;
 use JSON::MaybeXS;
+use App::MCP::CLI::Client qw(content_text);
 use App::MCP::CLI::Config qw(load_config resolve_server_cmd);
 
 =encoding utf8
@@ -94,10 +94,11 @@ mode and works with any compliant MCP server script.
 =head2 HTTP/SSE
 
 When the resolved server endpoint begins with C<http://> or C<https://>, or
-when the config entry contains a C<url> key or C<transport: sse>, the client
-connects in SSE mode.  It first makes a C<GET> request to the SSE endpoint to
-obtain the dynamic C<POST> URL broadcast by the C<endpoint> event, then sends
-all subsequent JSON-RPC messages as C<POST> requests to that URL.
+when the config entry contains a C<url> key, the client connects in SSE mode.
+It opens the event stream with a C<GET> request, reads the C<endpoint> event
+to learn the C<POST> URL, then sends all JSON-RPC messages as C<POST> requests
+to that URL. Responses are accepted either in the C<POST> reply body or as
+C<message> events on the stream. See L<App::MCP::CLI::Client>.
 
 =head1 CONFIGURATION FILE
 
@@ -113,16 +114,16 @@ contain:
 
 =over 4
 
-=item C<command> (string) — executable to launch (stdio mode).
+=item C<command> (string) - executable to launch (stdio mode).
 
-=item C<args> (array of strings) — additional arguments for the executable.
+=item C<args> (array of strings) - additional arguments for the executable.
 
-=item C<env> (object) — environment variables to set before launching.
+=item C<env> (object) - environment variables for the launched server only.
 
-=item C<url> (string) — SSE endpoint URL (SSE mode).
+=item C<url> (string) - SSE endpoint URL (SSE mode).
 
-=item C<transport> (string) — set to C<"sse"> to force SSE mode even when no
-C<url> is given.
+=item C<transport> (string) - informational (C<"stdio"> or C<"sse">); a server
+is SSE when it has a C<url>. C<"sse"> without a C<url> is an error.
 
 =back
 
@@ -168,7 +169,8 @@ Example configuration:
 
 =item C<--server|-s> I<name_or_path>
 
-B<(Required)> The MCP server to connect to.  Can be:
+The MCP server to connect to (optional when the config file defines exactly
+one server).  Can be:
 
 =over 4
 
@@ -189,12 +191,16 @@ C<ollama> is currently supported.
 
 =item C<--model|-m> I<name>  (default: C<qwen2.5:1.5b>)
 
-The Ollama model tag to query.  Any model available on the local Ollama
-instance (L<http://localhost:11434>) can be specified.
+The Ollama model tag to query.  Any model available on the Ollama instance
+(L<http://localhost:11434> unless C<OLLAMA_HOST> is set) can be specified.
 
 =item C<--config|-c> I<path>
 
 Path to a JSON configuration file.  See L</CONFIGURATION FILE> above.
+
+=item C<--timeout|-t> I<seconds>
+
+How long to wait for each MCP server reply (default 30; C<0> waits forever).
 
 =back
 
@@ -239,6 +245,10 @@ sub opt_spec {
         [ 'config|c=s',
           'Path to MCP configuration JSON file'
         ],
+        [ 'timeout|t=i',
+          'seconds to wait for the MCP server (0 = forever)',
+          { default => 30 }
+        ],
     );
 }
 
@@ -247,6 +257,11 @@ sub opt_spec {
 Main entry point.  Resolves the server, connects to it, retrieves tools,
 and runs the agent REPL until the user types C<exit>/C<quit> or sends EOF.
 
+The model's decision is validated before anything is executed: it must be a
+JSON object, and a requested tool must exist on the server (otherwise the
+request is ignored with a message). Tool failures (transport errors, JSON-RPC
+errors, or results flagged C<isError>) are reported and the session continues.
+
 =cut
 
 sub execute {
@@ -254,119 +269,42 @@ sub execute {
 
     my $json = JSON::MaybeXS->new(utf8 => 1, allow_nonref => 1);
 
-    my $config_data  = load_config($opt->config);
-    my $server_input = $opt->server // $args->[0];
+    my ($client, $tools);
+    my $ok = eval {
+        my $config_data = load_config($opt->config);
 
-    if (!$server_input) {
-        print STDERR "ERROR: You must specify an MCP server name or path.\n";
-        print STDERR "Usage: ./mcp-cli.pl chat --server <server_name_or_file>\n";
-        if ($config_data && $config_data->{mcpServers}) {
-            print STDERR "Available configured servers: "
-                . join(", ", sort keys %{ $config_data->{mcpServers} }) . "\n";
-        }
-        exit 1;
-    }
-
-    $self->{confirm_tools} = 1;
-    if ($config_data && exists $config_data->{confirmTools}) {
-        $self->{confirm_tools} = $config_data->{confirmTools} ? 1 : 0;
-    }
-
-    my ($cmd, $sse_url) = resolve_server_cmd($config_data, $server_input);
-    my $is_sse = defined $sse_url ? 1 : 0;
-
-    my ($out, $in, $pid);
-    my ($ua_mcp, $mcp_post_url);
-
-    if ($is_sse) {
-        print "[-] Connecting to MCP Server via HTTP/SSE: $sse_url\n";
-        $ua_mcp = HTTP::Tiny->new(timeout => 60);
-
-        # Establish the SSE Handshake and grab the dynamic client posting
-        # endpoint. According to the MCP Specification, the SSE server
-        # broadcasts an 'endpoint' event.
-        # HTTP::Tiny does not support streaming callbacks, so we fetch the
-        # SSE response in full and parse the endpoint event from the body.
-        my $res = $ua_mcp->get($sse_url, {
-            headers => { 'Accept' => 'text/event-stream' }
-        });
-
-        if (!$res->{success}) {
-            die "Error: Failed to connect to SSE endpoint ($res->{status}): $res->{reason}\n";
+        $self->{confirm_tools} = 1;
+        if ($config_data && exists $config_data->{confirmTools}) {
+            $self->{confirm_tools} = $config_data->{confirmTools} ? 1 : 0;
         }
 
-        my $response_text = $res->{content} // '';
-        if ($response_text =~ /event:\s*endpoint\s*\ndata:\s*([^\n]+)/s ||
-            $response_text =~ /data:\s*([^\n]+)/s) {
-            my $match = $1;
-            $match =~ s/^\s+|\s+$//g;
-            if ($match =~ /^https?:\/\//i) {
-                $mcp_post_url = $match;
-            } else {
-                my ($proto) = $sse_url =~ /^(https?:\/\/[^\/]+)/i;
-                $mcp_post_url = $proto . $match;
-            }
-        }
+        my ($cmd, $url, $env) =
+            resolve_server_cmd($config_data, $opt->server // $args->[0]);
 
-        if (!$mcp_post_url) {
-            die "Error: Failed to obtain a valid HTTP POST client endpoint from SSE stream.\n";
-        }
-        print "[-] SSE Channel Established. Target Post Route: $mcp_post_url\n";
-
-    } else {
-        $App::MCP::CLI::Command::SERVER_CMD = $cmd;
-        print "[-] Launching Local Pipe MCP Server: @$App::MCP::CLI::Command::SERVER_CMD\n";
-        $pid = open2($out, $in, @$App::MCP::CLI::Command::SERVER_CMD)
-            or die "Failed to boot server: $!";
-    }
-
-    my $send_mcp_request = sub {
-        my ($payload) = @_;
-
-        my $raw_payload = $json->encode($payload);
-        if ($is_sse) {
-            my $post_res = $ua_mcp->post(
-                $mcp_post_url,
-                {
-                    headers => { 'content-type' => 'application/json' },
-                    content => $raw_payload,
-                }
-            );
-
-            if (!$post_res->{success}) {
-                die "MCP HTTP Transport Exception ($post_res->{status}): $post_res->{reason}";
-            }
-
-            return $json->decode($post_res->{content} || '{}');
+        if (defined $url) {
+            print "[-] Connecting to MCP Server via HTTP/SSE: $url\n";
         }
         else {
-            print $in $raw_payload . "\n";
-            my $line = <$out>;
-            return $json->decode(scalar $line);
+            print "[-] Launching Local Pipe MCP Server: @$cmd\n";
         }
+
+        $client = App::MCP::CLI::Client->new(
+            cmd => $cmd, url => $url, env => $env,
+            timeout => $opt->timeout, client_name => 'mcp-interactive-client',
+        );
+        $client->connect;
+        print "[-] SSE Channel Established. Target Post Route: $client->{post_url}\n"
+            if $client->is_sse;
+
+        $tools = $client->list_tools;
+        1;
     };
-
-    my $init_res = $send_mcp_request->({
-        id      => 1,
-        jsonrpc => "2.0",
-        method  => "initialize",
-        params  => {
-            protocolVersion => "2024-11-05",
-            capabilities    => {},
-            clientInfo      => {
-                name    => "mcp-interactive-client",
-                version => "1.0"
-            }
-        }
-    });
-
-    my $list_res = $send_mcp_request->({
-        id      => 2,
-        jsonrpc => "2.0",
-        method  => "tools/list"
-    });
-
-    my $tools = $list_res->{result}{tools} // [];
+    if (!$ok) {
+        my $err = $@ || "unknown error\n";
+        $err .= "\n" unless $err =~ /\n\z/;
+        print STDERR "Error: $err";
+        exit 1;
+    }
 
     print "[+] Connected to MCP Server. Found " . scalar(@$tools) . " tool(s).\n";
     print "[-] Connected to LLM provider '" . $opt->provider . "' using model '" . $opt->model . "'.\n";
@@ -374,6 +312,13 @@ sub execute {
 
     $self->{provider} = $opt->provider;
     $self->{model}    = $opt->model;
+
+    my $warn = sub {
+        my ($label, $msg) = @_;
+        $msg = "unknown error" unless defined $msg && length $msg;
+        $msg =~ s/\s+\z//;
+        print "\e[1;31m$label\e[0m $msg\n\n";
+    };
 
     while (1) {
         print "\e[1;36mYou>\e[0m ";
@@ -387,10 +332,18 @@ sub execute {
         print "Thinking...\n";
 
         my $decision = $self->_ask_llm($user_query, $tools);
+        my $action   = ref $decision eq 'HASH' && !ref $decision->{action}
+                     ? ($decision->{action} // '') : '';
 
-        if ($decision && $decision->{action} eq 'call_tool') {
-            my $tool_name = $decision->{tool};
-            my $tool_args = $decision->{arguments};
+        if ($action eq 'call_tool') {
+            my $tool_name = ref $decision->{tool} ? '' : ($decision->{tool} // '');
+            my $tool_args = ref $decision->{arguments} eq 'HASH' ? $decision->{arguments} : {};
+
+            my ($tool) = grep { ($_->{name} // '') eq $tool_name } @$tools;
+            if (!$tool) {
+                $warn->('Response:', "The model asked for a tool that does not exist ('$tool_name'); ignoring it.");
+                next;
+            }
 
             print " -> \e[1;33m[Agent decided to call tool '$tool_name' with args: " .
                   $json->encode($tool_args) .
@@ -408,40 +361,55 @@ sub execute {
             }
 
             if ($proceed) {
-                # Execute the tool via our unified abstraction helper
-                my $tool_res = $send_mcp_request->({
-                    id      => 3,
-                    jsonrpc => "2.0",
-                    method  => "tools/call",
-                    params  => {
-                        name      => $tool_name,
-                        arguments => $tool_args
-                    }
-                });
+                my $tool_res = eval { $client->call_tool($tool_name, $tool_args) };
+                if (!$tool_res) {
+                    $warn->('Error:', $@);
+                    next;
+                }
+                if (my $e = $tool_res->{error}) {
+                    $warn->('Error:', $e->{message});
+                    next;
+                }
 
-                my $content_blocks = $tool_res->{result}{content} // [];
-                my $raw_result = join("\n", map { $_->{text} }
-                                 grep {
-                                     $_->{type} eq 'text'
-                                 } @$content_blocks);
+                my $result     = $tool_res->{result} || {};
+                my $raw_result = content_text($result);
+                if ($result->{isError}) {
+                    $warn->('Tool error:', $raw_result);
+                    next;
+                }
 
                 my $final_reply = $self->_summarize_with_llm($user_query, $raw_result);
                 print "\e[1;32mResponse:\e[0m $final_reply\n\n";
             }
         }
-        elsif ($decision && $decision->{action} eq 'reply') {
-            print "\e[1;32mResponse:\e[0m " . $decision->{answer} . "\n\n";
+        elsif ($action eq 'reply') {
+            my $answer = $decision->{answer};
+            $answer = $json->encode($answer) if ref $answer;
+            print "\e[1;32mResponse:\e[0m " . ($answer // '') . "\n\n";
         }
         else {
             print "\e[1;31mResponse:\e[0m Failed to parse structural response from LLM.\n\n";
         }
     }
 
-    if (!$is_sse) {
-        close($in); close($out); waitpid($pid, 0);
-    }
+    $client->close;
 
     print "[-] Session Closed.\n";
+}
+
+=head2 _ollama_url
+
+Returns the Ollama C</api/generate> URL. The base address defaults to
+C<http://localhost:11434> and can be changed with the C<OLLAMA_HOST>
+environment variable (with or without the C<http://> prefix).
+
+=cut
+
+sub _ollama_url {
+    my $base = $ENV{OLLAMA_HOST} || 'http://localhost:11434';
+    $base = "http://$base" unless $base =~ m{^https?://}i;
+    $base =~ s{/+\z}{};
+    return "$base/api/generate";
 }
 
 =head2 _ask_llm( $query, $tools )
@@ -453,7 +421,9 @@ with a bare JSON object in one of two forms:
     { "action": "call_tool", "tool": "<name>", "arguments": { ... } }
     { "action": "reply",     "answer": "<text>" }
 
-Returns the decoded hashref, or a synthetic C<reply> hashref on error.
+Returns the decoded hashref. If the model's output is not a JSON object, or
+the request fails, a synthetic C<reply> hashref describing the problem (or
+containing the raw text) is returned instead.
 
 =cut
 
@@ -477,7 +447,7 @@ sub _ask_llm {
                       . "Respond with valid raw JSON only, no markdown blocks.";
 
     my $res = $ua->post(
-        'http://localhost:11434/api/generate',
+        _ollama_url(),
         {
             headers => { 'content-type' => 'application/json' },
             content => $json->encode({
@@ -490,15 +460,18 @@ sub _ask_llm {
 
     if ($res->{success}) {
         # Raw text body resides inside the 'content' key
-        my $body = $json->decode($res->{content});
-        my $raw_response = $body->{response};
+        my $body = eval { $json->decode($res->{content}) };
+        my $raw_response = ref $body eq 'HASH' ? $body->{response} : undef;
+
+        return { action => 'reply', answer => 'The LLM returned an empty or unreadable response.' }
+            unless defined $raw_response && !ref $raw_response;
 
         $raw_response =~ s/\`{3}(?:json)?//g;
         $raw_response =~ s/\`{3}//g;
         $raw_response =~ s/^\s+|\s+$//g;
 
         my $parsed = eval { $json->decode($raw_response) };
-        if ($@) {
+        if ($@ || ref $parsed ne 'HASH') {
             return { action => 'reply', answer => $raw_response };
         }
 
@@ -533,7 +506,7 @@ sub _summarize_with_llm {
                . "Provide a brief, natural language response answering the user's question based on this data.";
 
     my $res = $ua->post(
-        'http://localhost:11434/api/generate',
+        _ollama_url(),
         {
             headers => { 'content-type' => 'application/json' },
             content => $json->encode({
@@ -546,7 +519,7 @@ sub _summarize_with_llm {
 
     if ($res->{success}) {
         my $body = eval { $json->decode($res->{content}) };
-        return $body ? $body->{response} : $result;
+        return (ref $body eq 'HASH' && defined $body->{response}) ? $body->{response} : $result;
     }
 
     return "HTTP Error ($res->{status}): $res->{reason}";
@@ -558,7 +531,7 @@ In addition to the core L<App::MCP::CLI> dependencies, this command requires:
 
 =over 4
 
-=item * L<HTTP::Tiny> — for Ollama API calls and SSE transport.
+=item * L<HTTP::Tiny> - for Ollama API calls and SSE transport.
 
 =back
 
@@ -604,10 +577,6 @@ You can also look for information at:
 =item * BUG Report
 
 L<https://github.com/manwar/App-MCP-CLI/issues>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/App-MCP-CLI>
 
 =item * Search MetaCPAN
 

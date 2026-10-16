@@ -6,7 +6,7 @@
     },
     "weather-sse-service": {
       "transport": "sse",
-      "url": "http://localhost:8082/sse"
+      "url": "http://localhost:8080/sse"
     }
   },
   "confirmTools": false

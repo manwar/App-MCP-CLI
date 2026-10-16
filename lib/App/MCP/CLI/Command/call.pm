@@ -9,8 +9,8 @@ our $AUTHORITY = 'cpan:MANWAR';
 
 use App::MCP::CLI -command;
 
-use IPC::Open2;
 use JSON::MaybeXS;
+use App::MCP::CLI::Client qw(content_text);
 use App::MCP::CLI::Config qw(load_config resolve_server_cmd);
 
 =encoding utf8
@@ -26,51 +26,101 @@ This module is distributed as part of L<App::MCP::CLI> v0.0.1.
 =head1 SYNOPSIS
 
     # Invoke a tool with inline key=value arguments
-    mcpcli call greet name=Alice
+    mcpcli call add_numbers --server perl-math-server a=10 b=5
 
-    # Invoke a tool and be prompted for each required argument
-    mcpcli call weather
+    # Invoke a tool and be prompted for each argument
+    mcpcli call add_numbers --server perl-math-server
 
-    # Override the server command for a single invocation
-    MCP_SERVER="node server.js" mcpcli call add a=3 b=4
+    # Against a script, a raw command, or an SSE URL
+    mcpcli call add_numbers --server ./stdio_server.pl a=3 b=4
+    mcpcli call get_mock_weather --server http://localhost:8080/sse location=London
 
 =head1 DESCRIPTION
 
 C<App::MCP::CLI::Command::call> implements the C<call> sub-command of the
-C<mcpcli> application.  It connects to an MCP server via a bidirectional
-stdio pipe, performs the JSON-RPC 2.0 C<initialize> handshake, and then
-dispatches a C<tools/call> request.
+C<mcpcli> application.  It connects to an MCP server over stdio or HTTP/SSE
+(through L<App::MCP::CLI::Client>), performs the handshake, and dispatches a
+C<tools/call> request.
 
 =head2 Argument handling
 
 Arguments are supplied on the command line as C<key=value> pairs after the
-tool name:
+tool name. Anything that is not a C<key=value> pair is a usage error.
 
     mcpcli call mytool param1=hello param2=42
 
-Numeric-looking values (integers and decimals) are cast to JSON numbers
-automatically.  All other values are treated as JSON strings.
+The command asks the server for the tool's input schema and uses it to give
+each value the right JSON type:
 
-When no arguments are given, the command enters an B<interactive prompt mode>:
-it first calls C<tools/list> to retrieve the tool's input schema, then
-presents each property individually in the terminal, labelling required fields
-in red and optional fields in the default colour.  Entering an empty value for
-a required field causes the command to abort with an error message.
+=over 4
+
+=item * C<string> properties are always sent as strings, so C<007> stays
+C<"007"> and C<1.0> stays C<"1.0">.
+
+=item * C<integer> and C<number> properties are sent as numbers when the
+value looks numeric.
+
+=item * C<boolean> properties accept C<true/false>, C<yes/no> and C<1/0>.
+
+=item * C<array> and C<object> properties are parsed as JSON.
+
+=item * Properties without a declared type (or tools whose schema is not
+available) fall back to a conservative rule: plain decimal numbers without
+leading zeros become JSON numbers, everything else stays a string.
+
+=back
+
+Required properties that were not supplied cause an error before anything is
+sent to the server.
+
+When no arguments are given at all, the command enters an B<interactive
+prompt mode>: it presents each property of the tool's schema in the terminal
+(prompts go to STDERR), labelling required fields in red when STDERR is a
+terminal. Entering an empty value for a required field aborts with an error.
 
 =head2 Output
 
-On success the text blocks inside the C<result.content> array are printed to
-standard output.  On failure the C<error.message> field from the JSON-RPC
-response is printed prefixed with C<Error:>.
+Only the tool's result is written to STDOUT, so it can be piped. Text blocks
+are printed as-is. Other block types are not dropped: images and audio become
+a one-line placeholder with their MIME type and size, resources are printed
+(or described), and C<structuredContent> is pretty-printed when there is no
+other content. Progress messages and errors go to STDERR.
+
+=head2 Exit status
+
+=over 4
+
+=item C<0> - the tool ran and reported success.
+
+=item C<1> - connection or configuration failure, timeout, unknown tool,
+missing argument, a JSON-RPC error from the server, or a tool result with
+C<isError: true> (its text is printed to STDERR).
+
+=back
 
 =head1 USAGE
 
-    mcpcli call <tool_name> [key=value ...]
+    mcpcli call <tool_name> [key=value ...] [--server <name|path|url|command>]
+                [--config <file>] [--timeout <seconds>]
 
 =head1 OPTIONS
 
-This sub-command does not define additional flags beyond those inherited from
-L<App::Cmd>.  Use C<mcpcli help call> for the built-in help text.
+=over 4
+
+=item C<--server|-s> I<name>
+
+Server name from the config file, a C<.pl> script, a URL, or a command. May be
+omitted when the config file defines exactly one server.
+
+=item C<--config|-c> I<path>
+
+Path to the JSON configuration file. See L<App::MCP::CLI::Config>.
+
+=item C<--timeout|-t> I<seconds>
+
+How long to wait for each server reply (default 30; C<0> waits forever).
+
+=back
 
 =head1 INTERNAL METHODS
 
@@ -83,8 +133,10 @@ via L<App::Cmd>.
 
 sub opt_spec {
     return (
-        [ 'server|s=s', 'server name from config'  ],
-        [ 'config|c=s', 'path to config JSON file' ],
+        [ 'server|s=s',  'server name, script path, URL or command'            ],
+        [ 'config|c=s',  'path to config JSON file'                            ],
+        [ 'timeout|t=i', 'seconds to wait for the server (0 = forever)',
+                         { default => 30 }                                      ],
     );
 }
 
@@ -107,8 +159,8 @@ sub usage_desc  { '%c call <tool_name> [key=value key2=value2]' }
 
 =head2 validate_args
 
-Validates that at least one positional argument (the tool name) has been
-supplied; calls C<usage_error> otherwise.
+Validates that a tool name was supplied and that every further argument is a
+C<key=value> pair; calls C<usage_error> otherwise.
 
 =cut
 
@@ -117,6 +169,12 @@ sub validate_args {
 
     $self->usage_error("You must specify a tool name to call.")
         if !@$args;
+
+    my (undef, @pairs) = @$args;
+    foreach my $arg (@pairs) {
+        $self->usage_error("Invalid argument '$arg': expected key=value.")
+            if $arg !~ /^[^=]+=/;
+    }
 }
 
 =head2 execute( $opt, $args )
@@ -130,151 +188,161 @@ interactively), submits the C<tools/call> request, and prints the response.
 sub execute {
     my ($self, $opt, $args) = @_;
 
-    my $config_data = load_config($opt->config);
-    my ($cmd)       = resolve_server_cmd($config_data, $opt->server);
+    my ($tool_name, @pairs) = @$args;
+    my %raw = map { /^([^=]+)=(.*)$/s ? ($1 => $2) : () } @pairs;
 
-    $App::MCP::CLI::Command::SERVER_CMD = $cmd;
+    my $status = eval { $self->_run($opt, $tool_name, \%raw, scalar @pairs) };
+    if (my $err = $@) {
+        $err .= "\n" unless $err =~ /\n\z/;
+        print STDERR "Error: $err";
+        exit 1;
+    }
 
-    my $tool_name = shift @$args;
+    exit $status if $status;
+}
 
-    my $json = JSON::MaybeXS->new(utf8 => 1, allow_nonref => 1);
+sub _label {
+    my ($text, $code) = @_;
+    return -t STDERR ? "\e[${code}m$text\e[0m" : $text;
+}
 
-    my ($out, $in);
-    my $pid = open2($out, $in, @$App::MCP::CLI::Command::SERVER_CMD)
-        or die "Server failed: $!";
+sub _run {
+    my ($self, $opt, $tool_name, $raw, $npairs) = @_;
 
-    # Standard Protocol Handshake
-    print $in $json->encode({
-        id      => 1,
-        jsonrpc => "2.0",
-        method  => "initialize",
-        params  => {
-            protocolVersion => "2024-11-05",
-            capabilities    => {},
-            clientInfo      => { name => "mcp-cli-perl", version => "1.0" }
-        }
-    }) . "\n";
+    my $config_data       = load_config($opt->config);
+    my ($cmd, $url, $env) = resolve_server_cmd($config_data, $opt->server);
 
-    my $discard = <$out>;
+    my $client = App::MCP::CLI::Client->new(
+        cmd => $cmd, url => $url, env => $env, timeout => $opt->timeout,
+    );
+    $client->connect;
+
+    my $status = eval { $self->_call($client, $tool_name, $raw, $npairs) };
+    my $err    = $@;
+    $client->close;
+    die $err if $err;
+
+    return $status;
+}
+
+sub _call {
+    my ($self, $client, $tool_name, $raw, $npairs) = @_;
+
+    # Servers that do not implement tools/list can still be called directly.
+    my $tools = eval { $client->list_tools } || [];
+    my ($tool) = grep { ($_->{name} // '') eq $tool_name } @$tools;
+
+    if (@$tools && !$tool) {
+        print STDERR "Error: Tool '$tool_name' not found on server. Available: "
+                   . join(', ', map { $_->{name} // () } @$tools) . "\n";
+        return 1;
+    }
+
+    my $schema   = $tool ? ($tool->{inputSchema} || {}) : {};
+    my $props    = ref $schema->{properties} eq 'HASH'  ? $schema->{properties} : {};
+    my %required = map { $_ => 1 }
+                   @{ ref $schema->{required} eq 'ARRAY' ? $schema->{required} : [] };
 
     my %tool_args;
 
-    # Check if arguments were passed inline
-    if (@$args) {
-        foreach my $arg (@$args) {
-            if ($arg =~ /^([^=]+)=(.*)$/) {
-                $tool_args{$1} = $self->_clean_type($2);
-            }
+    if ($npairs) {
+        $tool_args{$_} = _coerce_value($raw->{$_}, $props->{$_}) for keys %$raw;
+
+        my @missing = grep { !exists $tool_args{$_} } sort keys %required;
+        if (@missing) {
+            print STDERR "Error: Missing required argument(s): " . join(', ', @missing) . "\n";
+            return 1;
         }
     }
-    # INTERACTIVE MODE: If no arguments given, discover requirements!
-    else {
-        print "[-] No arguments provided. Inspecting tool schema for '$tool_name'...\n";
+    elsif (keys %$props) {
+        print STDERR "\nEntering interactive prompt for '$tool_name':\n";
+        foreach my $key (sort keys %$props) {
+            my $prop = $props->{$key};
+            my $desc = $prop->{description} // 'No description';
+            my $type = $prop->{type} // 'string';
+            $type    = join('|', @$type) if ref $type eq 'ARRAY';
+            my $req  = $required{$key} ? _label('(required)', '1;31') : '(optional)';
 
-        # Ask server for tool list to find this tool's input schema
-        print $in $json->encode({
-            id      => 2,
-            jsonrpc => "2.0",
-            method  => "tools/list"
-        }) . "\n";
+            print STDERR "=> $key $req [$type - $desc]: ";
 
-        my $list_res = $json->decode(scalar <$out>);
-        my ($target_tool) = grep {
-            $_->{name} eq $tool_name
-        } @{ $list_res->{result}{tools} // [] };
+            my $input = <STDIN>;
+            defined($input) ? chomp($input) : ($input = '');
 
-        if (!$target_tool) {
-            print "\n\e[1;31mError:\e[0m Tool '$tool_name' not found on server.\n\n";
-
-            close($in);
-            close($out);
-            waitpid($pid, 0);
-            return;
-        }
-
-        # Parse the JSON Schema properties
-        my $properties  = $target_tool->{inputSchema}{properties} // {};
-        my $required    = $target_tool->{inputSchema}{required}   // [];
-        my %is_required = map { $_ => 1 } @$required;
-
-        if (keys %$properties) {
-            print "\nEntering interactive prompt for '$tool_name':\n";
-            foreach my $key (sort keys %$properties) {
-                my $prop = $properties->{$key};
-                my $desc = $prop->{description} // 'No description';
-                my $type = $prop->{type} // 'string';
-                my $req_label = $is_required{$key}
-                                ? "\e[1;31m(required)\e[0m"
-                                : "(optional)";
-
-                # Dynamic terminal prompt
-                print "=> $key $req_label [$type - $desc]: ";
-
-                my $input = <STDIN>;
-                defined($input) ? chomp($input) : ($input = '');
-
-                if ($input eq '' && $is_required{$key}) {
-                    print "\e[1;31mError: $key is required!\e[0m\n";
-                    close($in);
-                    close($out);
-                    waitpid($pid, 0);
-                    return;
-                }
-
-                if ($input ne '') {
-                    $tool_args{$key} = $self->_clean_type($input);
-                }
+            if ($input eq '' && $required{$key}) {
+                print STDERR _label("Error: $key is required!", '1;31') . "\n";
+                return 1;
             }
-            print "\n";
+
+            $tool_args{$key} = _coerce_value($input, $prop) if $input ne '';
         }
+        print STDERR "\n";
     }
 
-    # Execute the Tool
-    print "Calling tool '$tool_name'...\n";
-    my $call_payload = {
-        id      => 3,
-        jsonrpc => "2.0",
-        method  => "tools/call",
-        params  => {
-            name      => $tool_name,
-            arguments => \%tool_args
-        }
-    };
+    print STDERR "[-] Calling tool '$tool_name'...\n";
+    my $res = $client->call_tool($tool_name, \%tool_args);
 
-    print $in $json->encode($call_payload) . "\n";
-    my $res = $json->decode(scalar <$out>);
-
-    print "\n";
-    if ($res->{error}) {
-        print "\e[1;31mError:\e[0m " . $res->{error}{message} . "\n";
-    } else {
-        print "\e[1;32mResponse:\e[0m\n";
-        my $content = $res->{result}{content} // [];
-        foreach my $block (@$content) {
-            if ($block->{type} eq 'text') {
-                print $block->{text} . "\n";
-            }
-        }
+    if (my $e = $res->{error}) {
+        my $code = defined $e->{code} ? " (code $e->{code})" : '';
+        print STDERR _label('Error:', '1;31') . " " . ($e->{message} // 'unknown error') . "$code\n";
+        return 1;
     }
-    print "\n";
 
-    close($in); close($out); waitpid($pid, 0);
+    my $result = $res->{result} || {};
+    my $text   = content_text($result);
+
+    if ($result->{isError}) {
+        print STDERR _label('Error:', '1;31') . " "
+                   . (length $text ? $text : 'the tool reported an error') . "\n";
+        return 1;
+    }
+
+    print "$text\n" if length $text;
+    return 0;
 }
 
-=head2 _clean_type( $value )
+=head2 _coerce_value( $value, $property_schema )
 
-Helper that coerces a string value to a Perl number when it looks like an
-integer or decimal, so that JSON serialization produces the correct type.
-Returns the value unchanged for non-numeric strings.
+Plain function (not a method). Converts the command-line string C<$value> to
+the JSON type declared by C<$property_schema> (the property's entry in the
+tool's C<inputSchema>, may be C<undef>). See L</Argument handling> for the
+rules. Values that do not fit the declared type are passed through unchanged
+so that the server can report a precise validation error.
 
 =cut
 
-sub _clean_type {
-    my ($self, $val) = @_;
+sub _coerce_value {
+    my ($val, $prop) = @_;
 
-    if ($val =~ /^-?\d+(\.\d+)?$/) {
-        return 0 + $val;
+    my $type = ref $prop eq 'HASH' ? $prop->{type} : undef;
+    $type = (grep { defined && $_ ne 'null' } @$type)[0] if ref $type eq 'ARRAY';
+    $type //= '';
+
+    # Numbers with more than 15 digits would lose precision as a Perl NV.
+    my $safe = sub { length($_[0] =~ s/\D//gr) <= 15 };
+
+    if ($type eq 'string')  { return $val }
+
+    if ($type eq 'integer') {
+        return ($val =~ /^-?\d+$/ && $safe->($val)) ? 0 + $val : $val;
     }
+
+    if ($type eq 'number') {
+        return ($val =~ /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/ && $safe->($val)) ? 0 + $val : $val;
+    }
+
+    if ($type eq 'boolean') {
+        return JSON::MaybeXS::true()  if $val =~ /^(?:true|yes|1)$/i;
+        return JSON::MaybeXS::false() if $val =~ /^(?:false|no|0)$/i;
+        return $val;
+    }
+
+    if ($type eq 'array' || $type eq 'object') {
+        my $data = eval { JSON::MaybeXS->new(utf8 => 0, allow_nonref => 1)->decode($val) };
+        return ref $data ? $data : $val;
+    }
+
+    # Unknown type: only plain decimals without leading zeros are numbers.
+    return 0 + $val if $val =~ /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/ && $safe->($val);
     return $val;
 }
 
@@ -317,10 +385,6 @@ You can also look for information at:
 =item * BUG Report
 
 L<https://github.com/manwar/App-MCP-CLI/issues>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/App-MCP-CLI>
 
 =item * Search MetaCPAN
 

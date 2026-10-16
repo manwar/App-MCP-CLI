@@ -2,23 +2,17 @@
 
 use strict;
 use warnings;
-use Test::More tests => 7;
+use Test::More tests => 8;
 
-BEGIN {
-    use_ok('App::MCP::CLI')
-        || print "Bail out!\n";
-    use_ok('App::MCP::CLI::Config')
-        || print "Bail out!\n";
-    use_ok('App::MCP::CLI::Command::list')
-        || print "Bail out!\n";
-    use_ok('App::MCP::CLI::Command::call')
-        || print "Bail out!\n";
-    use_ok('App::MCP::CLI::Command::interactive')
-        || print "Bail out!\n";
-    use_ok('App::MCP::CLI::Command::servers')
-        || print "Bail out!\n";
-    use_ok('App::MCP::CLI::Command::version')
-        || print "Bail out!\n";
-}
+use_ok($_) for qw(
+    App::MCP::CLI
+    App::MCP::CLI::Client
+    App::MCP::CLI::Config
+    App::MCP::CLI::Command::list
+    App::MCP::CLI::Command::call
+    App::MCP::CLI::Command::interactive
+    App::MCP::CLI::Command::servers
+    App::MCP::CLI::Command::version
+);
 
 diag( "Testing App::MCP::CLI $App::MCP::CLI::VERSION, Perl $], $^X" );

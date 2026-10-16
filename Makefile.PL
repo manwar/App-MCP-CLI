@@ -23,18 +23,39 @@ WriteMakefile(
         'App::Cmd'          => '0.330',
         'IPC::Open2'        => 0,
         'HTTP::Tiny'        => 0,
+        'IO::Handle'        => 0,
+        'IO::Socket::INET'  => 0,
         'JSON::MaybeXS'     => 0,
+        'POSIX'             => 0,
+        'Scalar::Util'      => 0,
         'Text::Table::Tiny' => 0,
+        'Time::HiRes'       => 0,
         'File::Spec'        => 0,
     },
     dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean => { FILES => 'App-MCP-CLI-*' },
     (eval { ExtUtils::MakeMaker->VERSION(6.46) } ? (META_MERGE => {
         'meta-spec' => { version => 2 },
+        prereqs     => {
+            runtime => { recommends => {
+                'IO::Socket::SSL' => 0,   # https:// MCP servers
+                'MCP'             => 0,   # examples/stdio_server.pl
+                'HTTP::Daemon'    => 0,   # examples/sse_server.pl
+            } },
+            test => { recommends => {
+                'Test::Pod'           => '1.22',
+                'Test::CheckManifest' => '0.9',
+                'HTTP::Daemon'        => 0,
+            } },
+        },
         provides    => {
             'App::MCP::CLI' => {
                 file    => 'lib/App/MCP/CLI.pm',
                 version => MM->parse_version('lib/App/MCP/CLI.pm')
+            },
+            'App::MCP::CLI::Client' => {
+                file    => 'lib/App/MCP/CLI/Client.pm',
+                version => MM->parse_version('lib/App/MCP/CLI/Client.pm')
             },
             'App::MCP::CLI::Config' => {
                 file    => 'lib/App/MCP/CLI/Config.pm',
