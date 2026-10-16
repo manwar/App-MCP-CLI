@@ -107,6 +107,28 @@ mcpcli call add_numbers --server perl-math-server
 
 **Talk to it in natural language** (requires Ollama):
 
+Follow this to install `Ollama` first:
+
+```sh
+docker run -d -v ollama:/root/.ollama -p 11434:11434 --name ollama ollama/ollama
+```
+
+Then pull the model `qwen2.5:1.5b`, the default model used by the `mcpcli`.
+
+This can be overriden by the switch `--model` flag.
+
+```sh
+docker exec -it ollama ollama pull qwen2.5:1.5b
+```
+
+Verify if the model is installed:
+
+```sh
+docker exec -it ollama ollama list
+```
+
+Now start the `mcpcli` session in `chat` mode:
+
 ```sh
 mcpcli chat --server perl-math-server
 ```
@@ -121,7 +143,7 @@ call, and the model summarises the result. Type `exit` or `quit` to leave.
 You can also skip the config file and give a script path directly:
 
 ```sh
-mcpcli list --server ./stdio_server.pl
+mcpcli chat --server ./stdio_server.pl
 ```
 
 ## Example 2: SSE server (`sse_server.pl`)
